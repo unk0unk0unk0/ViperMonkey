@@ -41,10 +41,12 @@ __version__ = '0.02'
 
 # --- IMPORTS ------------------------------------------------------------------
 
+import logging
 from pyparsing import *
 
 from vba_object import *
 from literals import *
+import vb_str
 
 from logger import log
 
@@ -68,7 +70,8 @@ class Chr(VBA_Object):
         # extract argument from the tokens:
         # Here the arg is expected to be either an int or a VBA_Object
         self.arg = tokens[0]
-        log.debug('parsed %r as %s' % (self, self.__class__.__name__))
+        if (log.getEffectiveLevel() == logging.DEBUG):
+            log.debug('parsed %r as %s' % (self, self.__class__.__name__))
 
     def eval(self, context, params=None):
         # NOTE: in the specification, the parameter is expected to be an integer
@@ -89,7 +92,8 @@ class Chr(VBA_Object):
                 log.error("%r is not a valid chr() value. Returning ''." % param)
                 return ''            
         elif isinstance(param, float):
-            log.debug('Chr: converting float %r to integer' % param)
+            if (log.getEffectiveLevel() == logging.DEBUG):
+                log.debug('Chr: converting float %r to integer' % param)
             try:
                 param = int(round(param))
             except:
@@ -103,15 +107,16 @@ class Chr(VBA_Object):
             
         # Figure out whether to create a unicode or ascii character.
         converter = chr
-        if (param > 255):
-            converter = unichr
         if (param < 0):
             param = param * -1
+        if (param > 255):
+            converter = unichr
             
         # Do the conversion.
         try:
             r = converter(param)
-            log.debug("Chr(" + str(param) + ") = " + r)
+            if (log.getEffectiveLevel() == logging.DEBUG):
+                log.debug("Chr(" + str(param) + ") = " + r)
             return r
         except Exception as e:
             log.error(str(e))
@@ -122,10 +127,12 @@ class Chr(VBA_Object):
         return 'Chr(%s)' % repr(self.arg)
 
 # Chr, Chr$, ChrB, ChrW()
-chr_ = Suppress(Combine(( CaselessKeyword('Chr$') | CaselessKeyword('Chr') | \
-                          CaselessKeyword('ChrB$') | CaselessKeyword('ChrB') | \
-                          CaselessKeyword('ChrW$') | CaselessKeyword('ChrW')))) + \
-       Suppress('(') + expression + Suppress(')')
+chr_ = (
+    Suppress(Regex(re.compile('Chr[BW]?\$?', re.IGNORECASE)))
+    + Suppress('(')
+    + expression
+    + Suppress(')')
+)
 chr_.setParseAction(Chr)
 
 # --- ASC --------------------------------------------------------------------
@@ -137,17 +144,49 @@ class Asc(VBA_Object):
 
     def __init__(self, original_str, location, tokens):
         super(Asc, self).__init__(original_str, location, tokens)
-        # extract argument from the tokens:
-        # Here the arg is expected to be either a character or a VBA_Object
-        self.arg = tokens[0]
+
+        # This could be a asc(...) call or a reference to a variable called asc.
+        # If there are parsed arguments it is a call.
+        self.arg = None
+        if (len(tokens) > 0):
+            # Here the arg is expected to be either a character or a VBA_Object        
+            self.arg = tokens[0]
 
     def eval(self, context, params=None):
-        r = 0
-        try:
-            r = ord(eval_arg(self.arg, context)[0])
-        except:
-            pass
-        log.debug("Asc(%r): return %r" % (self.arg, r))
+
+        # Are we just looking up a variable called 'asc'?
+        if (self.arg is None):
+            try:
+                return context.get("asc")
+            except KeyError:
+                return "NULL"
+        
+        # Eval the argument.
+        c = eval_arg(self.arg, context)
+
+        # Don't modify the "**MATCH ANY**" special value.
+        if (str(c).strip() == "**MATCH ANY**"):
+            return c
+        
+        # Calling Asc() on int?
+        if (isinstance(c, int)):
+            r = c
+        else:
+
+            # Got a string.
+
+            # Should this match anything?
+            c = str(c)
+            if (c == "**MATCH ANY**"):
+                r = "**MATCH ANY**"
+
+            # This is an unmodified Asc() call.
+            else:
+                r = vb_str.get_ms_ascii_value(c)
+
+        # Return the result.
+        if (log.getEffectiveLevel() == logging.DEBUG):
+            log.debug("Asc: return %r" % r)
         return r
 
     def __repr__(self):
@@ -156,7 +195,7 @@ class Asc(VBA_Object):
 
 # Asc()
 # TODO: see MS-VBAL 6.1.2.11.1.1 page 240 => AscB, AscW
-asc = Suppress((CaselessKeyword('Asc') | CaselessKeyword('AscW'))  + '(') + expression + Suppress(')')
+asc = Suppress((CaselessKeyword('Asc') | CaselessKeyword('AscW')))  + Optional(Suppress('(') + expression + Suppress(')'))
 asc.setParseAction(Asc)
 
 # --- StrReverse() --------------------------------------------------------------------
@@ -201,7 +240,8 @@ class Environ(VBA_Object):
         # e.g. Environ("TEMP") => "%TEMP%"
         arg = eval_arg(self.arg, context=context)
         value = '%%%s%%' % arg
-        log.debug('evaluating Environ(%s) => %r' % (arg, value))
+        if (log.getEffectiveLevel() == logging.DEBUG):
+            log.debug('evaluating Environ(%s) => %r' % (arg, value))
         return value
 
     def __repr__(self):

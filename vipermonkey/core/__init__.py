@@ -84,6 +84,7 @@ __version__ = '0.04'
 # --- IMPORTS ------------------------------------------------------------------
 
 import sys
+import logging
 
 # TODO: add pyparsing to thirdparty folder, update setup.py
 from pyparsing import *
@@ -95,6 +96,8 @@ import prettytable
 import unidecode
 import string
 
+import subprocess
+
 from logger import log
 from procedures import Function
 from procedures import Sub
@@ -102,6 +105,8 @@ from function_call_visitor import *
 from function_defn_visitor import *
 from function_import_visitor import *
 from var_defn_visitor import *
+import filetype
+import read_ole_fields
 
 # === FUNCTIONS ==============================================================
 
@@ -112,14 +117,12 @@ def list_startswith(_list, lstart):
     :param lstart: list
     :return: bool, True if _list starts with all the items of lstart.
     """
-    # log.debug('list_startswith: %r <? %r' % (_list, lstart))
     if _list is None:
         return False
     lenlist = len(_list)
     lenstart = len(lstart)
     if lenlist >= lenstart:
         # if _list longer or as long as lstart, check 1st items:
-        # log.debug('_list[:lenstart] = %r' % _list[:lenstart])
         return (_list[:lenstart] == lstart)
     else:
         # _list smaller than lstart: always false
@@ -139,14 +142,37 @@ from vba_library import *
 class ViperMonkey(object):
     # TODO: load multiple modules from a file using olevba
 
-    def __init__(self, filename):
+    def __init__(self, filename, data):
+        self.comments = None
+        self.metadata = None
         self.filename = filename
+        self.data = data
         self.modules = []
         self.modules_code = []
         self.globals = {}
+        self.externals = {}
         # list of actions (stored as tuples by report_action)
         self.actions = []
+        self.vba = None
 
+        # Figure out whether this is VBScript or VBA.
+        vba_pointer = self.filename
+        is_data = False
+        if ((self.filename is None) or (len(self.filename.strip()) == 0)):
+            vba_pointer = self.data
+            is_data = True
+        self.is_vbscript = False
+        if (filetype.is_office_file(vba_pointer, is_data)):
+            self.is_vbscript = False
+            log.info("Emulating an Office (VBA) file.")
+        else:
+            self.is_vbscript = True
+            log.info("Emulating a VBScript file.")
+
+        # Olevba uses '\n' as EOL, regular VBScript uses '\r\n'.
+        if (self.is_vbscript == True):
+            vba_library.VBA_LIBRARY['vbCrLf'] = '\r\n'
+            
         # Track the loaded Excel spreadsheet (xlrd).
         self.loaded_excel = None
         
@@ -155,13 +181,17 @@ class ViperMonkey(object):
 
         # Track document text.
         self.doc_text = ""
+
+        # Track document tables.
+        self.doc_tables = []
         
         # List of entry point functions to emulate.
         self.entry_points = ['autoopen', 'document_open', 'autoclose',
                              'document_close', 'auto_open', 'autoexec',
                              'autoexit', 'document_beforeclose', 'workbook_open',
                              'workbook_activate', 'auto_close', 'workbook_close',
-                             'workbook_deactivate', 'documentopen', 'app_documentopen']
+                             'workbook_deactivate', 'documentopen', 'app_documentopen',
+                             'main']
 
         # List of suffixes of the names of callback functions that provide alternate
         # methods for running things on document (approximately) open.
@@ -193,8 +223,17 @@ class ViperMonkey(object):
                                   '_TitleChange',
                                   '_Initialize',
                                   '_Click',
-                                  '_BeforeClose']
+                                  '_OnConnecting',
+                                  '_BeforeClose',
+                                  '_OnDisconnected',
+                                  '_OnEnterFullScreenMode',
+                                  '_Zoom',
+                                  '_Scroll',
+                                  '_BeforeDropOrPaste']
                                   
+    def set_metadata(self, dat):
+        self.metadata = dat
+        
     def add_compiled_module(self, m):
         """
         Add an already parsed and processed module.
@@ -203,16 +242,23 @@ class ViperMonkey(object):
             return
         self.modules.append(m)
         for name, _sub in m.subs.items():
-            log.debug('storing sub "%s" in globals' % name)
+            if (log.getEffectiveLevel() == logging.DEBUG):
+                log.debug('(1) storing sub "%s" in globals' % name)
             self.globals[name.lower()] = _sub
+            self.globals[name] = _sub
         for name, _function in m.functions.items():
-            log.debug('storing function "%s" in globals' % name)
+            if (log.getEffectiveLevel() == logging.DEBUG):
+                log.debug('(1) storing function "%s" in globals' % name)
             self.globals[name.lower()] = _function
+            self.globals[name] = _function
         for name, _function in m.external_functions.items():
-            log.debug('storing external function "%s" in globals' % name)
+            if (log.getEffectiveLevel() == logging.DEBUG):
+                log.debug('(1) storing external function "%s" in globals' % name)
             self.globals[name.lower()] = _function
+            self.externals[name.lower()] = _function
         for name, _var in m.global_vars.items():
-            log.debug('storing global var "%s" = %s in globals (1)' % (name, str(_var)))
+            if (log.getEffectiveLevel() == logging.DEBUG):
+                log.debug('(1) storing global var "%s" = %s in globals (1)' % (name, str(_var)))
             if (isinstance(name, str)):
                 self.globals[name.lower()] = _var
             if (isinstance(name, list)):
@@ -245,7 +291,6 @@ class ViperMonkey(object):
         """
         # collapse long lines ending with " _"
         vba_code = vba_collapse_long_lines(vba_code)
-        # log.debug('Parsing VBA Module:\n' + vba_code)
         # m = Module(original_str=vba_code, location=0, tokens=[])
         # # store the code in the module object:
         # m.code = vba_code
@@ -257,7 +302,8 @@ class ViperMonkey(object):
             line_index, line, line_keywords = self.parse_next_line()
             # ignore empty lines
             if line_keywords is None:
-                log.debug('Empty line or comment: ignored')
+                if (log.getEffectiveLevel() == logging.DEBUG):
+                    log.debug('Empty line or comment: ignored')
                 continue
             try:
                 # flag set to True when line starts with "public" or "private":
@@ -269,24 +315,29 @@ class ViperMonkey(object):
                 if line_keywords[0] == 'attribute':
                     l = header_statements_line.parseString(line, parseAll=True)
                 elif line_keywords[0] in ('option', 'dim', 'declare'):
-                    log.debug('DECLARATION LINE')
+                    if (log.getEffectiveLevel() == logging.DEBUG):
+                        log.debug('DECLARATION LINE')
                     l = declaration_statements_line.parseString(line, parseAll=True)
                 elif line_keywords[0] == 'sub':
-                    log.debug('SUB')
+                    if (log.getEffectiveLevel() == logging.DEBUG):
+                        log.debug('SUB')
                     l = sub_start_line.parseString(line, parseAll=True)
                     l[0].statements = self.parse_block(end=['end', 'sub'])
                 elif line_keywords[0] == 'function':
-                    log.debug('FUNCTION')
+                    if (log.getEffectiveLevel() == logging.DEBUG):
+                        log.debug('FUNCTION')
                     l = function_start_line.parseString(line, parseAll=True)
                     l[0].statements = self.parse_block(end=['end', 'function'])
                 elif line_keywords[0] == 'for':
-                    log.debug('FOR LOOP')
+                    if (log.getEffectiveLevel() == logging.DEBUG):
+                        log.debug('FOR LOOP')
                     # NOTE: a for clause may be followed by ":" and statements on the same line
                     l = for_start.parseString(line) #, parseAll=True)
                     l[0].statements = self.parse_block(end=['next'])
                 else:
                     l = vba_line.parseString(line, parseAll=True)
-                log.debug(l)
+                if (log.getEffectiveLevel() == logging.DEBUG):
+                    log.debug(l)
                 # if isinstance(l[0], Sub):
                 #     # parse statements
                 #     pass
@@ -303,28 +354,34 @@ class ViperMonkey(object):
         self.modules.append(m)
         # # TODO: add all subs/functions and global variables to self.globals
         for name, _sub in m.subs.items():
-            log.debug('storing sub "%s" in globals' % name)
+            if (log.getEffectiveLevel() == logging.DEBUG):
+                log.debug('(2) storing sub "%s" in globals' % name)
             self.globals[name.lower()] = _sub
         for name, _function in m.functions.items():
-            log.debug('storing function "%s" in globals' % name)
+            if (log.getEffectiveLevel() == logging.DEBUG):
+                log.debug('(2) storing function "%s" in globals' % name)
             self.globals[name.lower()] = _function
         for name, _function in m.external_functions.items():
-            log.debug('storing external function "%s" in globals' % name)
+            if (log.getEffectiveLevel() == logging.DEBUG):
+                log.debug('(2) storing external function "%s" in globals' % name)
             self.globals[name.lower()] = _function
+            self.externals[name.lower()] = _function
         for name, _var in m.global_vars.items():
-                log.debug('storing global var "%s" in globals (2)' % name)
+                if (log.getEffectiveLevel() == logging.DEBUG):
+                    log.debug('(2) storing global var "%s" in globals (2)' % name)
             
     def parse_next_line(self):
         # extract next line
         line = self.lines.pop(0)
-        log.debug('Parsing line %d: %s' % (self.line_index, line.rstrip()))
+        if (log.getEffectiveLevel() == logging.DEBUG):
+            log.debug('Parsing line %d: %s' % (self.line_index, line.rstrip()))
         self.line_index += 1
         # extract first two keywords in lowercase, for quick matching
         line_keywords = line.lower().split(None, 2)
-        log.debug('line_keywords: %r' % line_keywords)
+        if (log.getEffectiveLevel() == logging.DEBUG):
+            log.debug('line_keywords: %r' % line_keywords)
         # ignore empty lines
         if len(line_keywords) == 0 or line_keywords[0].startswith("'"):
-            # log.debug('Empty line or comment: ignored')
             return self.line_index-1, line, None
         return self.line_index-1, line, line_keywords
 
@@ -339,7 +396,8 @@ class ViperMonkey(object):
         while not list_startswith(line_keywords, end):
             try:
                 l = vba_line.parseString(line, parseAll=True)
-                log.debug(l)
+                if (log.getEffectiveLevel() == logging.DEBUG):
+                    log.debug(l)
                 statements.extend(l)
             except ParseException as err:
                 print('*** PARSING ERROR (3) ***')
@@ -388,41 +446,127 @@ class ViperMonkey(object):
         return r
         
     def trace(self, entrypoint='*auto'):
+
+        # Clear out any intermediate IOCs from a previous run.
+        vba_context.intermediate_iocs = set()
+        
         # TODO: use the provided entrypoint
         # Create the global context for the engine
         context = Context(_globals=self.globals,
                           engine=self,
                           doc_vars=self.doc_vars,
                           loaded_excel=self.loaded_excel,
-                          filename=self.filename)
+                          filename=self.filename,
+                          metadata=self.metadata)
+        context.is_vbscript = self.is_vbscript
 
+        # Add any URLs we can pull directly from the file being analyzed.
+        fname = self.filename
+        is_data = False
+        if ((fname is None) or (len(fname.strip()) == 0)):
+            fname = self.data
+            is_data = True
+        direct_urls = read_ole_fields.pull_urls_office97(fname, is_data, self.vba)
+        for url in direct_urls:
+            context.save_intermediate_iocs(url)
+        
+        # Save the true names of imported external functions.
+        for func_name in self.externals.keys():
+            func = self.externals[func_name]
+            context.dll_func_true_names[func.name] = func.alias_name
+
+        # Save the document tables in the context.
+        context.globals["__DOC_TABLE_CONTENTS__"] = self.doc_tables
+            
         # Save the document text in the proper variable in the context.
+        context.globals["Me.Content.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["Me.Range.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["Me.Range".lower()] = "\n".join(self.doc_text)
+        context.globals["Me.Content.Start".lower()] = 0
+        context.globals["Me.Content.End".lower()] = len("\n".join(self.doc_text))
+        context.globals["Me.Paragraphs".lower()] = self.doc_text
         context.globals["ActiveDocument.Content.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["ActiveDocument.Range.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["ActiveDocument.Range".lower()] = "\n".join(self.doc_text)
         context.globals["ActiveDocument.Content.Start".lower()] = 0
         context.globals["ActiveDocument.Content.End".lower()] = len("\n".join(self.doc_text))
         context.globals["ActiveDocument.Paragraphs".lower()] = self.doc_text
-        
+        context.globals["ThisDocument.Content.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["ThisDocument.Range.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["ThisDocument.Range".lower()] = "\n".join(self.doc_text)
+        context.globals["ThisDocument.Content.Start".lower()] = 0
+        context.globals["ThisDocument.Content.End".lower()] = len("\n".join(self.doc_text))
+        context.globals["ThisDocument.Paragraphs".lower()] = self.doc_text
+        context.globals["['Me'].Content.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["['Me'].Range.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["['Me'].Range".lower()] = "\n".join(self.doc_text)
+        context.globals["['Me'].Content.Start".lower()] = 0
+        context.globals["['Me'].Content.End".lower()] = len("\n".join(self.doc_text))
+        context.globals["['Me'].Paragraphs".lower()] = self.doc_text
+        context.globals["['ActiveDocument'].Content.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["['ActiveDocument'].Range.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["['ActiveDocument'].Range".lower()] = "\n".join(self.doc_text)
+        context.globals["['ActiveDocument'].Content.Start".lower()] = 0
+        context.globals["['ActiveDocument'].Content.End".lower()] = len("\n".join(self.doc_text))
+        context.globals["['ActiveDocument'].Paragraphs".lower()] = self.doc_text
+        context.globals["['ThisDocument'].Content.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["['ThisDocument'].Range.Text".lower()] = "\n".join(self.doc_text)
+        context.globals["['ThisDocument'].Range".lower()] = "\n".join(self.doc_text)
+        context.globals["['ThisDocument'].Content.Start".lower()] = 0
+        context.globals["['ThisDocument'].Content.End".lower()] = len("\n".join(self.doc_text))
+        context.globals["['ThisDocument'].Paragraphs".lower()] = self.doc_text
+        context.globals["['ActiveDocument'].Characters".lower()] = list("\n".join(self.doc_text))
+        context.globals["ActiveDocument.Characters".lower()] = list("\n".join(self.doc_text))
+        context.globals["ActiveDocument.Characters.Count".lower()] = long(len(self.doc_text))
+        context.globals["Count".lower()] = 1
+        context.globals[".Pages.Count".lower()] = 1
+        context.globals["me.Pages.Count".lower()] = 1
+        context.globals["['ThisDocument'].Characters".lower()] = list("\n".join(self.doc_text))
+        context.globals["ThisDocument.Characters".lower()] = list("\n".join(self.doc_text))
+
+        # Break out document words.
+        doc_words = []
+        for word in re.split(r"[ \n]", "\n".join(self.doc_text)):
+            word = word.strip()
+            if (word.startswith("-")):
+                word = word[1:]
+                doc_words.append("-")
+            doc_words.append(word.strip())
+        context.globals["ActiveDocument.Words".lower()] = doc_words
+        context.globals["ThisDocument.Words".lower()] = doc_words
+            
+        # Fake up some comments if needed.
+        if (self.comments is None):
+            context.globals["ActiveDocument.Comments".lower()] = ["Comment 1", "Comment 2"]
+            context.globals["ThisDocument.Comments".lower()] = ["Comment 1", "Comment 2"]
+        else:
+            context.globals["ActiveDocument.Comments".lower()] = self.comments
+            context.globals["ThisDocument.Comments".lower()] = self.comments
+            
         # reset the actions list, in case it is called several times
         self.actions = []
 
         # Track the external functions called.
         self.external_funcs = self._get_external_funcs()
+        context.external_funcs = self.external_funcs
 
         # First emulate any Visual Basic that appears outside of subs/funcs.
         log.info("Emulating loose statements...")
         done_emulation = False
         for m in self.modules:
             if (m.eval(context=context)):
-                done_emulation = True
+                context.dump_all_files(autoclose=True)
+                done_emulation = context.got_actions
         
         # Look for hardcoded entry functions.
         for entry_point in self.entry_points:
             entry_point = entry_point.lower()
-            log.debug("Trying entry point " + entry_point)
+            if (log.getEffectiveLevel() == logging.DEBUG):
+                log.debug("Trying entry point " + entry_point)
             if entry_point in self.globals:
                 context.report_action('Found Entry Point', str(entry_point), '')
                 self.globals[entry_point].eval(context=context)
-                context.dump_all_files()
+                context.dump_all_files(autoclose=True)
                 done_emulation = True
 
         # Look for callback functions that can act as entry points.
@@ -441,28 +585,28 @@ class ViperMonkey(object):
                         # Emulate it.
                         context.report_action('Found Entry Point', str(name), '')
                         item.eval(context=context)
-                        context.dump_all_files()
+                        context.dump_all_files(autoclose=True)
                         done_emulation = True
 
         # Did we find an entry point?
         if (not done_emulation):
 
-            # Count the # of subroutines in the document.
-            only_sub = None
-            sub_name = None
-            sub_count = 0
+            # Try heuristics to find possible entry points.
+            log.warn("No entry points found. Using heuristics to find entry points...")
+            
+            # Find any 0 argument subroutines. We will try emulating these as potential entry points.
+            zero_arg_subs = []
             for name in self.globals.keys():
                 item = self.globals[name]
-                if (isinstance(item, Sub)):
-                    only_sub = item
-                    sub_name = name
-                    sub_count += 1
-
-            # If there is only 1 subroutine, emulate that.
-            if (sub_count == 1):
-                context.report_action('Found Entry Point', str(sub_name), '')
+                if ((isinstance(item, Sub)) and (len(item.params) == 0)):
+                    zero_arg_subs.append(item)
+                    
+            # Emulate all 0 argument subroutines as potential entry points.
+            for only_sub in zero_arg_subs:
+                sub_name = only_sub.name
+                context.report_action('Found Heuristic Entry Point', str(sub_name), '')
                 only_sub.eval(context=context)
-                context.dump_all_files()
+                context.dump_all_files(autoclose=True)
                 
     def eval(self, expr):
         """
@@ -478,7 +622,8 @@ class ViperMonkey(object):
         # reset the actions list, in case it is called several times
         self.actions = []
         e = expression.parseString(expr)[0]
-        log.debug('e=%r - type=%s' % (e, type(e)))
+        if (log.getEffectiveLevel() == logging.DEBUG):
+            log.debug('e=%r - type=%s' % (e, type(e)))
         value = e.eval(context=context)
         return value
 
@@ -519,6 +664,13 @@ class ViperMonkey(object):
         t.max_width['Parameters'] = 25
         t.max_width['Description'] = 25
         for action in self.actions:
+            # Cut insanely large results down to size.
+            str_action = str(action)
+            if (len(str_action) > 50000):
+                new_params = str(action[1])
+                if (len(new_params) > 50000):
+                    new_params = new_params[:25000] + "... <SNIP> ..." + new_params[-25000:]
+                action = (action[0], new_params, action[2])
             t.add_row(action)
         return t
 

@@ -14,7 +14,7 @@ https://github.com/decalage2/ViperMonkey
 
 # === LICENSE ==================================================================
 
-# ViperMonkey is copyright (c) 2015-2016 Philippe Lagadec (http://www.decalage.info)
+# ViperMonkey is copyright (c) 2015-2019 Philippe Lagadec (http://www.decalage.info)
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without modification,
@@ -44,7 +44,7 @@ https://github.com/decalage2/ViperMonkey
 # 2015-2016        PL: - many updates
 # 2016-06-11 v0.02 PL: - split vipermonkey into several modules
 
-__version__ = '0.02'
+__version__ = '0.08'
 
 # ------------------------------------------------------------------------------
 # TODO:
@@ -55,6 +55,26 @@ import logging
 
 # === LOGGING =================================================================
 
+class CappedFileHandler(logging.FileHandler):
+
+    # default size cap of 30M
+    # log file is put in the working directory with the same name
+    def __init__(self, filename, sizecap, mode='w', encoding=None, delay=False):
+        self.size_cap = sizecap
+        self.current_size = 0
+        self.cap_exceeded = False
+        super(CappedFileHandler, self).__init__(filename, mode, encoding, delay)
+
+    def emit(self, record):
+        if not self.cap_exceeded:
+            new_size = self.current_size + len(self.formatter.format(record))
+            if new_size <= self.size_cap:
+                self.current_size = new_size
+                super(CappedFileHandler, self).emit(record)
+            # regardless of whether or not a future log could be within the size cap, cut it off here
+            else:
+                self.cap_exceeded = True
+
 class DuplicateFilter(logging.Filter):
 
     def filter(self, record):
@@ -64,18 +84,6 @@ class DuplicateFilter(logging.Filter):
             self.last_log = current_log
             return True
         return False
-
-class NullHandler(logging.Handler):
-    """
-    Log Handler without output, to avoid printing messages if logging is not
-    configured by the main application.
-    Python 2.7 has logging.NullHandler, but this is necessary for 2.6:
-    see https://docs.python.org/2.6/library/logging.html#configuring-logging-for-a-library
-    """
-
-    def emit(self, record):
-        pass
-
 
 def get_logger(name, level=logging.NOTSET):
     """
@@ -100,7 +108,7 @@ def get_logger(name, level=logging.NOTSET):
     logger = logging.getLogger(name)
     # only add a NullHandler for this logger, it is up to the application
     # to configure its own logging:
-    logger.addHandler(NullHandler())
+    logger.addHandler(logging.NullHandler())
     logger.setLevel(level)
     # Skip duplicate log messages.
     logger.addFilter(DuplicateFilter()) 

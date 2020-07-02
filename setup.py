@@ -41,14 +41,18 @@ entry_points = {
 
 setup(
     name="vipermonkey",
-    version="0.07",  # 0.0x not compliant with PEP440, setuptools normalizes to 0.x
+    version="0.08",  # 0.0x not compliant with PEP440, setuptools normalizes to 0.x
     description=(
         "ViperMonkey is a VBA Emulation engine written in Python, designed to "
         "analyze and deobfuscate malicious VBA Macros contained in Microsoft "
         "Office files (Word, Excel, PowerPoint, Publisher, etc)."),
     long_description=open("README.md").read(),
     install_requires=[
-        "oletools",
+        # TODO: oletools 0.54.2 requires cryptography, which is not compatible with PyPy (oletools issue #473)
+        # => on PyPy, pin to oletools 0.54.1:
+        'oletools==0.54.1; platform_python_implementation=="PyPy"',
+        # => Otherwise, use the latest oletools:
+        'oletools; platform_python_implementation!="PyPy"',
         "olefile",
         "prettytable",
         "colorlog",
@@ -56,9 +60,11 @@ setup(
         "pyparsing==2.3.0", # pyparsing 2.4.0 triggers a MemoryError on some samples (issue #58)
         "unidecode",
         "xlrd",
+        "regex",
     ],
     packages=["vipermonkey", "vipermonkey.core"],
-    #scripts=["vipermonkey/vmonkey.py", "vipermonkey/vbashell.py"],
+    setup_requires=["pytest-runner"],
+    tests_require=["pytest"],
     entry_points=entry_points,
     author="Philippe Lagadec",
     url="https://github.com/decalage2/ViperMonkey",

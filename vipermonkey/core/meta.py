@@ -12,6 +12,7 @@ Project Repository:
 https://github.com/decalage2/ViperMonkey
 """
 
+import logging
 import subprocess
 
 from logger import log
@@ -30,6 +31,8 @@ def get_metadata_exif(filename):
         return {}
 
     # Sanity check results.
+    if (log.getEffectiveLevel() == logging.DEBUG):
+        log.debug("exiftool output: '" + str(output) + "'")
     if (":" not in output):
         log.warning("Cannot read metadata with exiftool.")
         return {}
@@ -39,35 +42,11 @@ def get_metadata_exif(filename):
     r = FakeMeta()
     for line in lines:
         line = line.strip()
-        if (len(line) == 0):
-            continue
+        if ((len(line) == 0) or (":" not in line)):
+            continue        
         field = line[:line.index(":")].strip().lower()
         val = line[line.index(":") + 1:].strip()
         setattr(r, field, val)
 
     # Done.
-    return r
-
-metadata = None
-
-def read_metadata_item(var):
-
-    # Make sure we read in the metadata.
-    if (metadata is None):
-        log.error("BuiltInDocumentProperties: Metadata not read.")
-        return ""
-    
-    # Nomalize the variable name.
-    var = var.lower()
-    if ("." in var):
-        var = var[:var.index(".")]
-    
-    # See if we can find the metadata attribute.
-    if (not hasattr(metadata, var)):
-        log.error("BuiltInDocumentProperties: Metadata field '" + var + "' not found.")
-        return ""
-
-    # We have the attribute. Return it.
-    r = getattr(metadata, var)
-    log.debug("BuiltInDocumentProperties: return %r -> %r" % (var, r))
     return r
